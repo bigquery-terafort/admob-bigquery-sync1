@@ -122,7 +122,7 @@ NETWORK_SCHEMA = [
     bigquery.SchemaField("estimated_earnings_micros", "INTEGER"),
     bigquery.SchemaField("impressions", "INTEGER"),
     bigquery.SchemaField("impression_ctr", "FLOAT"),
-    bigquery.SchemaField("impression_rpm_micros", "INTEGER"),
+    bigquery.SchemaField("impression_rpm_micros", "FLOAT"),
     bigquery.SchemaField("matched_requests", "INTEGER"),
     bigquery.SchemaField("match_rate", "FLOAT"),
     bigquery.SchemaField("show_rate", "FLOAT"),
