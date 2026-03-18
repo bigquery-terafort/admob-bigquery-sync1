@@ -883,10 +883,16 @@ def sync_range(v1, v1beta, bq: bigquery.Client, account: str,
     totals["network_adtype"] = load_rows(bq, FACT_TABLE, UNIFIED_FACT_SCHEMA, nat_rows)
 
     # 3. Mediation report
-    print("  Fetching mediation report …")
-    med_report = fetch_mediation(v1, account, mediation_request(start, end))
-    med_rows   = parse_mediation(med_report, run_id)
-    totals["mediation"] = load_rows(bq, FACT_TABLE, UNIFIED_FACT_SCHEMA, med_rows)
+    try:
+        print("  Fetching mediation report …")
+        med_report = fetch_mediation(v1, account, mediation_request(start, end))
+        med_rows   = parse_mediation(med_report, run_id)
+        totals["mediation"] = load_rows(bq, FACT_TABLE, UNIFIED_FACT_SCHEMA, med_rows)
+    except HttpError as e:
+        if e.resp.status == 403:
+            print("  WARNING: Mediation skipped — 403.")
+        else:
+            raise
 
     # 4. Campaign report (optional, v1beta)
     if include_campaign and v1beta:
