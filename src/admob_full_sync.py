@@ -1,15 +1,11 @@
 """
-AdMob → BigQuery  (Single Unified Table) — FINAL VERSION
-
-Key Improvements
-────────────────
-1. Token auto-refreshes itself — never expires mid-run
-2. Per-chunk token refresh — fresh token for every chunk
-3. Timeout increased to 180 seconds
-4. Mediation 403 handled gracefully
-5. Retry backoff improved
-6. All money fields correct FLOAT/INT types
-7. Default chunk = 1 day — safest for large backfills
+AdMob → BigQuery  (Single Unified Table) — v2
+===============================================
+Fixes vs v1:
+  1. Removed MOBILE_OS_VERSION, GMA_SDK_VERSION, APP_VERSION_NAME dimensions
+     — these caused 100K row limit to be hit every day
+  2. Removed localizationSettings from campaign_request — not supported by v1beta API
+  3. Campaign report still attempted if ENABLE_ADMOB_BETA_CAMPAIGN=true
 
 All AdMob data sources → ONE table: admob_unified_fact
   admob_network        → Network Report  (no AD_TYPE)
@@ -38,9 +34,7 @@ from googleapiclient.errors import HttpError
 from google.cloud import bigquery
 from google.oauth2 import service_account
 
-# Global timeout
 socket.setdefaulttimeout(180)
-
 
 # =============================================================================
 # CONFIG
@@ -66,9 +60,8 @@ LOG_TABLE    = "admob_sync_log"
 MAX_RETRIES   = 4
 RETRY_BACKOFF = 8
 
-
 # =============================================================================
-# BIGQUERY SCHEMAS
+# SCHEMAS
 # =============================================================================
 
 UNIFIED_FACT_SCHEMA = [
@@ -79,9 +72,6 @@ UNIFIED_FACT_SCHEMA = [
     bigquery.SchemaField("app_id",                    "STRING"),
     bigquery.SchemaField("app_name",                  "STRING"),
     bigquery.SchemaField("platform",                  "STRING"),
-    bigquery.SchemaField("mobile_os_version",         "STRING"),
-    bigquery.SchemaField("gma_sdk_version",           "STRING"),
-    bigquery.SchemaField("app_version_name",          "STRING"),
     bigquery.SchemaField("ad_unit_id",                "STRING"),
     bigquery.SchemaField("ad_unit_name",              "STRING"),
     bigquery.SchemaField("ad_format",                 "STRING"),
@@ -148,21 +138,20 @@ AD_UNITS_SCHEMA = [
 ]
 
 SYNC_LOG_SCHEMA = [
-    bigquery.SchemaField("run_id",             "STRING"),
-    bigquery.SchemaField("run_type",           "STRING"),
-    bigquery.SchemaField("start_date",         "DATE"),
-    bigquery.SchemaField("end_date",           "DATE"),
-    bigquery.SchemaField("status",             "STRING"),
-    bigquery.SchemaField("network_rows",       "INT64"),
-    bigquery.SchemaField("network_adtype_rows","INT64"),
-    bigquery.SchemaField("mediation_rows",     "INT64"),
-    bigquery.SchemaField("campaign_rows",      "INT64"),
-    bigquery.SchemaField("total_rows",         "INT64"),
-    bigquery.SchemaField("error_message",      "STRING"),
-    bigquery.SchemaField("duration_seconds",   "FLOAT64"),
-    bigquery.SchemaField("sync_timestamp",     "TIMESTAMP"),
+    bigquery.SchemaField("run_id",              "STRING"),
+    bigquery.SchemaField("run_type",            "STRING"),
+    bigquery.SchemaField("start_date",          "DATE"),
+    bigquery.SchemaField("end_date",            "DATE"),
+    bigquery.SchemaField("status",              "STRING"),
+    bigquery.SchemaField("network_rows",        "INT64"),
+    bigquery.SchemaField("network_adtype_rows", "INT64"),
+    bigquery.SchemaField("mediation_rows",      "INT64"),
+    bigquery.SchemaField("campaign_rows",       "INT64"),
+    bigquery.SchemaField("total_rows",          "INT64"),
+    bigquery.SchemaField("error_message",       "STRING"),
+    bigquery.SchemaField("duration_seconds",    "FLOAT64"),
+    bigquery.SchemaField("sync_timestamp",      "TIMESTAMP"),
 ]
-
 
 # =============================================================================
 # VALIDATION
@@ -183,13 +172,11 @@ def validate_config() -> bool:
         return False
     return True
 
-
 # =============================================================================
-# AUTH — Fresh token every time
+# AUTH
 # =============================================================================
 
 def get_fresh_credentials() -> Credentials:
-    """Always returns a fresh valid token. Auto-refreshes every call."""
     creds = Credentials(
         token=None,
         refresh_token=REFRESH_TOKEN,
@@ -205,7 +192,6 @@ def get_fresh_credentials() -> Credentials:
     print(f"  Token refreshed ✅")
     return creds
 
-
 def get_v1(creds):
     return build("admob", "v1", credentials=creds, cache_discovery=False)
 
@@ -218,7 +204,6 @@ def get_bq_client() -> bigquery.Client:
         info, scopes=["https://www.googleapis.com/auth/bigquery"]
     )
     return bigquery.Client(project=PROJECT_ID, credentials=creds, location=BQ_LOCATION)
-
 
 # =============================================================================
 # RETRY
@@ -239,7 +224,6 @@ def with_retry(fn, label="call"):
         print(f"  [{label}] attempt {attempt}/{MAX_RETRIES} failed — retrying in {wait}s …")
         time.sleep(wait)
     raise last_err
-
 
 # =============================================================================
 # HELPERS
@@ -311,7 +295,6 @@ def paginate(callable_, items_key: str) -> List[Dict]:
             break
     return results
 
-
 # =============================================================================
 # BIGQUERY OPS
 # =============================================================================
@@ -326,7 +309,6 @@ def ensure_dataset(bq: bigquery.Client):
         ds.location = BQ_LOCATION
         bq.create_dataset(ds)
         print(f"  Created dataset: {ds_id}")
-
 
 def ensure_table(bq: bigquery.Client, name: str, schema, is_fact=False):
     tid = f"{PROJECT_ID}.{DATASET_ID}.{name}"
@@ -343,7 +325,6 @@ def ensure_table(bq: bigquery.Client, name: str, schema, is_fact=False):
             t.clustering_fields = ["data_source", "app_id", "country_code", "ad_format"]
         bq.create_table(t)
         print(f"  Created table: {name}")
-
 
 def load_rows(bq: bigquery.Client, table: str, schema, rows: List[Dict],
               disposition=bigquery.WriteDisposition.WRITE_APPEND) -> int:
@@ -362,12 +343,10 @@ def load_rows(bq: bigquery.Client, table: str, schema, rows: List[Dict],
     print(f"  Loaded {n:,} rows → {table}")
     return n
 
-
 def delete_range(bq: bigquery.Client, table: str, start: date, end: date):
     tid = f"{PROJECT_ID}.{DATASET_ID}.{table}"
     bq.query(f"DELETE FROM `{tid}` WHERE report_date BETWEEN '{start}' AND '{end}'").result()
     print(f"  Deleted {table}: {start} → {end}")
-
 
 def write_log(bq, run_id, run_type, start, end, status, totals, error, duration):
     row = [{
@@ -389,7 +368,6 @@ def write_log(bq, run_id, run_type, start, end, status, totals, error, duration)
         load_rows(bq, LOG_TABLE, SYNC_LOG_SCHEMA, row)
     except Exception as e:
         print(f"  WARNING: sync_log write failed: {e}")
-
 
 # =============================================================================
 # DIMENSION SYNC
@@ -444,9 +422,10 @@ def sync_dims(v1, bq: bigquery.Client, account: str):
     load_rows(bq, DIM_AD_UNITS, AD_UNITS_SCHEMA, unit_rows,
               disposition=bigquery.WriteDisposition.WRITE_TRUNCATE)
 
-
 # =============================================================================
 # REPORT BUILDERS
+# FIX v2: Removed MOBILE_OS_VERSION, GMA_SDK_VERSION, APP_VERSION_NAME
+#         — these caused 100K row limit to be hit on every single day
 # =============================================================================
 
 def _base_spec(start: date, end: date) -> Dict:
@@ -457,37 +436,44 @@ def _base_spec(start: date, end: date) -> Dict:
 
 def network_request(start, end):
     spec = _base_spec(start, end)
-    spec["dimensions"] = ["DATE","APP","AD_UNIT","COUNTRY","FORMAT","PLATFORM",
-                          "MOBILE_OS_VERSION","GMA_SDK_VERSION","APP_VERSION_NAME","SERVING_RESTRICTION"]
-    spec["metrics"]    = ["AD_REQUESTS","MATCHED_REQUESTS","MATCH_RATE","IMPRESSIONS",
-                          "CLICKS","IMPRESSION_CTR","IMPRESSION_RPM","ESTIMATED_EARNINGS","SHOW_RATE"]
+    # FIX v2: Removed MOBILE_OS_VERSION, GMA_SDK_VERSION, APP_VERSION_NAME
+    spec["dimensions"] = ["DATE", "APP", "AD_UNIT", "COUNTRY", "FORMAT",
+                          "PLATFORM", "SERVING_RESTRICTION"]
+    spec["metrics"]    = ["AD_REQUESTS", "MATCHED_REQUESTS", "MATCH_RATE", "IMPRESSIONS",
+                          "CLICKS", "IMPRESSION_CTR", "IMPRESSION_RPM",
+                          "ESTIMATED_EARNINGS", "SHOW_RATE"]
     return {"reportSpec": spec}
 
 def network_adtype_request(start, end):
     spec = _base_spec(start, end)
-    spec["dimensions"] = ["DATE","APP","AD_UNIT","AD_TYPE","COUNTRY","FORMAT","PLATFORM",
-                          "MOBILE_OS_VERSION","GMA_SDK_VERSION","APP_VERSION_NAME","SERVING_RESTRICTION"]
-    spec["metrics"]    = ["MATCHED_REQUESTS","IMPRESSIONS","CLICKS",
-                          "IMPRESSION_CTR","ESTIMATED_EARNINGS","SHOW_RATE"]
+    # FIX v2: Removed MOBILE_OS_VERSION, GMA_SDK_VERSION, APP_VERSION_NAME
+    spec["dimensions"] = ["DATE", "APP", "AD_UNIT", "AD_TYPE", "COUNTRY",
+                          "FORMAT", "PLATFORM", "SERVING_RESTRICTION"]
+    spec["metrics"]    = ["MATCHED_REQUESTS", "IMPRESSIONS", "CLICKS",
+                          "IMPRESSION_CTR", "ESTIMATED_EARNINGS", "SHOW_RATE"]
     return {"reportSpec": spec}
 
 def mediation_request(start, end):
     spec = _base_spec(start, end)
-    spec["dimensions"] = ["DATE","APP","AD_UNIT","AD_SOURCE","AD_SOURCE_INSTANCE",
-                          "MEDIATION_GROUP","COUNTRY","FORMAT","PLATFORM",
-                          "MOBILE_OS_VERSION","GMA_SDK_VERSION","APP_VERSION_NAME","SERVING_RESTRICTION"]
-    spec["metrics"]    = ["AD_REQUESTS","MATCHED_REQUESTS","MATCH_RATE","IMPRESSIONS",
-                          "CLICKS","IMPRESSION_CTR","ESTIMATED_EARNINGS","OBSERVED_ECPM"]
+    # FIX v2: Removed MOBILE_OS_VERSION, GMA_SDK_VERSION, APP_VERSION_NAME
+    spec["dimensions"] = ["DATE", "APP", "AD_UNIT", "AD_SOURCE", "AD_SOURCE_INSTANCE",
+                          "MEDIATION_GROUP", "COUNTRY", "FORMAT", "PLATFORM",
+                          "SERVING_RESTRICTION"]
+    spec["metrics"]    = ["AD_REQUESTS", "MATCHED_REQUESTS", "MATCH_RATE", "IMPRESSIONS",
+                          "CLICKS", "IMPRESSION_CTR", "ESTIMATED_EARNINGS", "OBSERVED_ECPM"]
     return {"reportSpec": spec}
 
 def campaign_request(start, end):
-    spec = _base_spec(start, end)
-    spec["dimensions"] = ["DATE","CAMPAIGN_ID","CAMPAIGN_NAME","AD_ID","AD_NAME",
-                          "PLACEMENT_ID","PLACEMENT_NAME","PLACEMENT_PLATFORM","COUNTRY","FORMAT"]
-    spec["metrics"]    = ["IMPRESSIONS","CLICKS","CLICK_THROUGH_RATE",
-                          "INSTALLS","ESTIMATED_COST","AVERAGE_CPI","INTERACTIONS"]
+    # FIX v2: Removed localizationSettings — not supported by v1beta Campaign API
+    spec = {
+        "dateRange": {"startDate": to_api_date(start), "endDate": to_api_date(end)},
+    }
+    spec["dimensions"] = ["DATE", "CAMPAIGN_ID", "CAMPAIGN_NAME", "AD_ID", "AD_NAME",
+                          "PLACEMENT_ID", "PLACEMENT_NAME", "PLACEMENT_PLATFORM",
+                          "COUNTRY", "FORMAT"]
+    spec["metrics"]    = ["IMPRESSIONS", "CLICKS", "CLICK_THROUGH_RATE",
+                          "INSTALLS", "ESTIMATED_COST", "AVERAGE_CPI", "INTERACTIONS"]
     return {"reportSpec": spec}
-
 
 # =============================================================================
 # REPORT FETCHERS
@@ -508,7 +494,6 @@ def fetch_campaign(v1beta, account, body):
         lambda: v1beta.accounts().campaignReport().generate(parent=account, body=body).execute()
     )
 
-
 # =============================================================================
 # ROW PARSERS
 # =============================================================================
@@ -517,7 +502,6 @@ def _empty_row(source: str, ts: str, run_id: str) -> Dict:
     return {
         "data_source": source, "run_id": run_id, "sync_timestamp": ts,
         "app_id": None, "app_name": None, "platform": None,
-        "mobile_os_version": None, "gma_sdk_version": None, "app_version_name": None,
         "ad_unit_id": None, "ad_unit_name": None, "ad_format": None, "ad_type": None,
         "country_code": None, "country_name": None, "serving_restriction": None,
         "ad_source_id": None, "ad_source_name": None,
@@ -537,9 +521,6 @@ def _base_dims(row, dims):
         "app_id":              dim_val(dims, "APP"),
         "app_name":            dim_lbl(dims, "APP"),
         "platform":            dim_lbl(dims, "PLATFORM"),
-        "mobile_os_version":   dim_lbl(dims, "MOBILE_OS_VERSION"),
-        "gma_sdk_version":     dim_lbl(dims, "GMA_SDK_VERSION"),
-        "app_version_name":    dim_lbl(dims, "APP_VERSION_NAME"),
         "ad_unit_id":          dim_val(dims, "AD_UNIT"),
         "ad_unit_name":        dim_lbl(dims, "AD_UNIT"),
         "ad_format":           dim_lbl(dims, "FORMAT"),
@@ -547,7 +528,6 @@ def _base_dims(row, dims):
         "country_name":        dim_lbl(dims, "COUNTRY"),
         "serving_restriction": dim_lbl(dims, "SERVING_RESTRICTION"),
     })
-
 
 def parse_network(report, run_id):
     ts, rows = utc_now(), []
@@ -579,7 +559,6 @@ def parse_network(report, run_id):
         rows.append(row)
     return rows
 
-
 def parse_network_adtype(report, run_id):
     ts, rows = utc_now(), []
     for item in report:
@@ -606,7 +585,6 @@ def parse_network_adtype(report, run_id):
         })
         rows.append(row)
     return rows
-
 
 def parse_mediation(report, run_id):
     ts, rows = utc_now(), []
@@ -644,7 +622,6 @@ def parse_mediation(report, run_id):
         rows.append(row)
     return rows
 
-
 def parse_campaign(report, run_id):
     ts, rows = utc_now(), []
     for item in report:
@@ -656,29 +633,26 @@ def parse_campaign(report, run_id):
         row = _empty_row("admob_campaign", ts, run_id)
         row["report_date"] = dt
         row.update({
-            "platform":     dim_lbl(dims, "PLACEMENT_PLATFORM"),
-            "ad_unit_id":   dim_val(dims, "AD_ID"),
-            "ad_unit_name": dim_lbl(dims, "AD_NAME"),
-            "ad_format":    dim_lbl(dims, "FORMAT"),
-            "country_code": dim_val(dims, "COUNTRY"),
-            "country_name": dim_lbl(dims, "COUNTRY"),
-            "campaign_id":  dim_val(dims, "CAMPAIGN_ID"),
-            "campaign_name":dim_lbl(dims, "CAMPAIGN_NAME"),
-            "ad_id":        dim_val(dims, "AD_ID"),
-            "ad_name":      dim_lbl(dims, "AD_NAME"),
-            "placement_id": dim_val(dims, "PLACEMENT_ID"),
+            "platform":      dim_lbl(dims, "PLACEMENT_PLATFORM"),
+            "ad_format":     dim_lbl(dims, "FORMAT"),
+            "country_code":  dim_val(dims, "COUNTRY"),
+            "country_name":  dim_lbl(dims, "COUNTRY"),
+            "campaign_id":   dim_val(dims, "CAMPAIGN_ID"),
+            "campaign_name": dim_lbl(dims, "CAMPAIGN_NAME"),
+            "ad_id":         dim_val(dims, "AD_ID"),
+            "ad_name":       dim_lbl(dims, "AD_NAME"),
+            "placement_id":  dim_val(dims, "PLACEMENT_ID"),
             "placement_name":dim_lbl(dims, "PLACEMENT_NAME"),
-            "impressions":  metric_val(mets.get("IMPRESSIONS")),
-            "clicks":       metric_val(mets.get("CLICKS")),
-            "ctr":          metric_val(mets.get("CLICK_THROUGH_RATE")),
-            "installs":     metric_val(mets.get("INSTALLS")),
-            "spend_micros": metric_val(mets.get("ESTIMATED_COST")),
-            "cpi_micros":   metric_val(mets.get("AVERAGE_CPI")),
-            "interactions": metric_val(mets.get("INTERACTIONS")),
+            "impressions":   metric_val(mets.get("IMPRESSIONS")),
+            "clicks":        metric_val(mets.get("CLICKS")),
+            "ctr":           metric_val(mets.get("CLICK_THROUGH_RATE")),
+            "installs":      metric_val(mets.get("INSTALLS")),
+            "spend_micros":  metric_val(mets.get("ESTIMATED_COST")),
+            "cpi_micros":    metric_val(mets.get("AVERAGE_CPI")),
+            "interactions":  metric_val(mets.get("INTERACTIONS")),
         })
         rows.append(row)
     return rows
-
 
 # =============================================================================
 # ACCOUNT
@@ -694,7 +668,6 @@ def get_account_name(v1) -> str:
         raise ValueError("No AdMob accounts found.")
     return accounts[0]["name"]
 
-
 # =============================================================================
 # ENSURE TABLES
 # =============================================================================
@@ -708,9 +681,8 @@ def ensure_all_tables(bq: bigquery.Client):
     ensure_table(bq, DIM_AD_UNITS, AD_UNITS_SCHEMA)
     ensure_table(bq, LOG_TABLE,    SYNC_LOG_SCHEMA)
 
-
 # =============================================================================
-# SYNC ONE CHUNK — Fresh token every time!
+# SYNC ONE CHUNK
 # =============================================================================
 
 def sync_range(account: str, bq: bigquery.Client,
@@ -719,7 +691,7 @@ def sync_range(account: str, bq: bigquery.Client,
 
     totals = {"network": 0, "network_adtype": 0, "mediation": 0, "campaign": 0}
 
-    # Fresh token for every single chunk
+    # Fresh token for every chunk
     creds  = get_fresh_credentials()
     v1     = get_v1(creds)
     v1beta = get_v1beta(creds) if include_campaign else None
@@ -730,12 +702,16 @@ def sync_range(account: str, bq: bigquery.Client,
     print("  Fetching network report …")
     net_rows = parse_network(
         fetch_report(v1, account, network_request(start, end)), run_id)
+    if len(net_rows) >= 99000:
+        print(f"  WARNING: network rows={len(net_rows)} — approaching 100K limit!")
     totals["network"] = load_rows(bq, FACT_TABLE, UNIFIED_FACT_SCHEMA, net_rows)
 
     # 2. Network adtype
     print("  Fetching network adtype report …")
     nat_rows = parse_network_adtype(
         fetch_report(v1, account, network_adtype_request(start, end)), run_id)
+    if len(nat_rows) >= 99000:
+        print(f"  WARNING: network_adtype rows={len(nat_rows)} — approaching 100K limit!")
     totals["network_adtype"] = load_rows(bq, FACT_TABLE, UNIFIED_FACT_SCHEMA, nat_rows)
 
     # 3. Mediation
@@ -743,6 +719,8 @@ def sync_range(account: str, bq: bigquery.Client,
         print("  Fetching mediation report …")
         med_rows = parse_mediation(
             fetch_mediation(v1, account, mediation_request(start, end)), run_id)
+        if len(med_rows) >= 99000:
+            print(f"  WARNING: mediation rows={len(med_rows)} — approaching 100K limit!")
         totals["mediation"] = load_rows(bq, FACT_TABLE, UNIFIED_FACT_SCHEMA, med_rows)
     except HttpError as e:
         if e.resp.status == 403:
@@ -762,7 +740,6 @@ def sync_range(account: str, bq: bigquery.Client,
 
     return totals
 
-
 # =============================================================================
 # MAIN SYNC
 # =============================================================================
@@ -773,7 +750,7 @@ def sync(days_back: int = 3, include_campaign: bool = False):
     end_date   = datetime.utcnow().date() - timedelta(days=1)
     start_date = end_date - timedelta(days=days_back - 1)
 
-    print(f"\n=== AdMob Unified Sync | run_id={rid} ===")
+    print(f"\n=== AdMob Unified Sync v2 | run_id={rid} ===")
     print(f"  Date range : {start_date} → {end_date}")
 
     creds   = get_fresh_credentials()
@@ -803,9 +780,8 @@ def sync(days_back: int = 3, include_campaign: bool = False):
     print(f"\n=== Sync complete ===")
     print(json.dumps(totals, indent=2))
 
-
 # =============================================================================
-# BACKFILL — Fresh token per chunk!
+# BACKFILL
 # =============================================================================
 
 def backfill(start_str: str, end_str: str, chunk: int = 1, include_campaign: bool = False):
@@ -817,7 +793,7 @@ def backfill(start_str: str, end_str: str, chunk: int = 1, include_campaign: boo
     if include_campaign and chunk > 30:
         chunk = 30
 
-    print(f"\n=== AdMob Backfill | run_id={rid} ===")
+    print(f"\n=== AdMob Backfill v2 | run_id={rid} ===")
     print(f"  Date range : {start_date} → {end_date}")
     print(f"  Chunk size : {chunk} day(s)")
 
@@ -839,14 +815,13 @@ def backfill(start_str: str, end_str: str, chunk: int = 1, include_campaign: boo
             chunk_end = min(cur + timedelta(days=chunk - 1), end_date)
             print(f"\nChunk: {cur} → {chunk_end}")
 
-            # Fresh token for EVERY chunk — this is the key fix!
             t = sync_range(account, bq, cur, chunk_end, include_campaign, rid)
 
             for k in grand:
                 grand[k] += t.get(k, 0)
 
             cur = chunk_end + timedelta(days=1)
-            time.sleep(2)  # Small pause between chunks
+            time.sleep(2)
 
     except Exception as e:
         status, error = "FAILED", str(e)
@@ -857,19 +832,18 @@ def backfill(start_str: str, end_str: str, chunk: int = 1, include_campaign: boo
     print(f"\n=== Backfill complete ===")
     print(json.dumps(grand, indent=2))
 
-
 # =============================================================================
 # CLI
 # =============================================================================
 
 def main():
-    p = argparse.ArgumentParser(description="AdMob → BigQuery unified sync")
-    p.add_argument("--days",             type=int, default=3)
-    p.add_argument("--backfill-start",   type=str)
-    p.add_argument("--backfill-end",     type=str)
-    p.add_argument("--chunk",            type=int, default=1)
-    p.add_argument("--chunk-days",       type=int, default=1)
-    p.add_argument("--enable-campaign",  action="store_true")
+    p = argparse.ArgumentParser(description="AdMob → BigQuery unified sync v2")
+    p.add_argument("--days",                 type=int, default=3)
+    p.add_argument("--backfill-start",       type=str)
+    p.add_argument("--backfill-end",         type=str)
+    p.add_argument("--chunk",                type=int, default=1)
+    p.add_argument("--chunk-days",           type=int, default=1)
+    p.add_argument("--enable-campaign",      action="store_true")
     p.add_argument("--enable-campaign-beta", action="store_true")
     args = p.parse_args()
 
@@ -887,7 +861,6 @@ def main():
     except Exception as e:
         print(f"FATAL ERROR: {e}")
         sys.exit(1)
-
 
 if __name__ == "__main__":
     main()
