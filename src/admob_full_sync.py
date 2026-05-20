@@ -1,27 +1,37 @@
 """
-AdMob → BigQuery  (Single Unified Table) — v3 FINAL
-=====================================================
-Root cause of 100K row limit: 219 apps × 3,170 ad units × 180 countries
-= millions of possible combinations per day.
+AdMob → BigQuery  (PRODUCTION v4) — pub-5972202469838280
+==========================================================
+THIS REPO HANDLES: pub-5972202469838280
 
-Fix: App-batched fetching using dimensionFilters.
-Instead of fetching all apps in one request, we filter each request
-to a small batch of apps. This guarantees we never hit 100K.
+VERSION HISTORY:
+  v3 FINAL: Original (no publisher_id, wiped other accounts' data)
+  v4:       Production-grade unified template
+            ✅ publisher_id in all schemas + rows
+            ✅ Publisher-scoped DELETEs (won't touch other accounts)
+            ✅ Auto schema migration (ALTER TABLE ADD COLUMN IF NOT EXISTS)
+            ✅ DELETE retry wrapper + schema verification
+            ✅ Hard fail if publisher_id env var is missing
+            ✅ Wait for schema cache after migrations
+            ✅ Specific NotFound exception (not bare except)
 
-Batch sizes (conservative, guaranteed safe):
-  network       : 5 apps per batch
-  network_adtype: 3 apps per batch
-  mediation     : 2 apps per batch
+REQUIRED ENV VARS:
+   ADMOB_PUBLISHER_ID    = pub-5972202469838280   (or accounts/pub-5972202469838280)
+   GCP_PROJECT_ID        = terafort
+   BQ_DATASET_ID         = Admob (default)
+   BQ_LOCATION           = US (default)
+   OAUTH_CLIENT_ID       = <OAuth client for pub-5972's AdMob account>
+   OAUTH_CLIENT_SECRET   = <OAuth secret>
+   OAUTH_REFRESH_TOKEN   = <Refresh token specific to pub-5972>
+   GCP_CREDENTIALS_JSON  = <Service account JSON>
 
-Also removed high-cardinality dimensions:
-  SERVING_RESTRICTION  — removed from all reports
-  AD_SOURCE_INSTANCE   — removed from mediation
+USAGE:
+   python admob_sync_v4.py --days 3
+   python admob_sync_v4.py --backfill-start 2026-04-30 --backfill-end 2026-05-19
 
-Campaign report: disabled — requires Google Ads account access (403)
-
-Money fields: INT64 MICROS — divide by 1,000,000 for USD
-Partition  : report_date (DAY)
-Cluster    : data_source, app_id, country_code, ad_format
+DATA MODEL:
+   Money fields: INT64 MICROS — divide by 1,000,000 for USD
+   Partition  : report_date (DAY)
+   Cluster    : data_source, app_id, country_code, ad_format
 """
 
 import os
@@ -38,6 +48,7 @@ from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from google.cloud import bigquery
+from google.api_core.exceptions import NotFound
 from google.oauth2 import service_account
 
 socket.setdefaulttimeout(180)
@@ -62,17 +73,20 @@ DIM_APPS     = "admob_apps_dim"
 DIM_AD_UNITS = "admob_ad_units_dim"
 LOG_TABLE    = "admob_sync_log"
 
-MAX_RETRIES   = 4
-RETRY_BACKOFF = 8
-ROW_LIMIT_WARN = 90000  # Warn if batch approaches 100K
+MAX_RETRIES    = 4
+RETRY_BACKOFF  = 8
+ROW_LIMIT_WARN = 90000
 
-# App batch sizes per report type — tuned to stay well under 100K
-BATCH_NETWORK       = 5  # 5 apps × ~14 ad units × 180 countries = ~12,600 max
-BATCH_NETWORK_ADTYPE= 3  # 3 apps × ~14 × 180 × 5 ad types = ~37,800 max
-BATCH_MEDIATION     = 2  # 2 apps × ~14 × 180 × 10 sources = ~50,400 max
+# App batch sizes per report type — proven safe vs 100K limit
+BATCH_NETWORK         = 5
+BATCH_NETWORK_ADTYPE  = 3
+BATCH_MEDIATION       = 2
+
+# Pause after ALTER TABLE to let BQ metadata cache refresh
+SCHEMA_CACHE_WAIT_SEC = 3
 
 # =============================================================================
-# SCHEMAS
+# SCHEMAS — publisher_id added to all tables that need attribution
 # =============================================================================
 
 UNIFIED_FACT_SCHEMA = [
@@ -80,6 +94,7 @@ UNIFIED_FACT_SCHEMA = [
     bigquery.SchemaField("data_source",               "STRING"),
     bigquery.SchemaField("run_id",                    "STRING"),
     bigquery.SchemaField("sync_timestamp",            "TIMESTAMP"),
+    bigquery.SchemaField("publisher_id",              "STRING"),
     bigquery.SchemaField("app_id",                    "STRING"),
     bigquery.SchemaField("app_name",                  "STRING"),
     bigquery.SchemaField("platform",                  "STRING"),
@@ -117,6 +132,7 @@ ACCOUNT_SCHEMA = [
 APPS_SCHEMA = [
     bigquery.SchemaField("app_resource_name",   "STRING"),
     bigquery.SchemaField("app_id",              "STRING"),
+    bigquery.SchemaField("publisher_id",        "STRING"),
     bigquery.SchemaField("platform",            "STRING"),
     bigquery.SchemaField("manual_display_name", "STRING"),
     bigquery.SchemaField("store_app_id",        "STRING"),
@@ -128,6 +144,7 @@ APPS_SCHEMA = [
 AD_UNITS_SCHEMA = [
     bigquery.SchemaField("ad_unit_resource_name", "STRING"),
     bigquery.SchemaField("ad_unit_id",            "STRING"),
+    bigquery.SchemaField("publisher_id",          "STRING"),
     bigquery.SchemaField("app_id",                "STRING"),
     bigquery.SchemaField("ad_unit_display_name",  "STRING"),
     bigquery.SchemaField("ad_format",             "STRING"),
@@ -137,6 +154,7 @@ AD_UNITS_SCHEMA = [
 
 SYNC_LOG_SCHEMA = [
     bigquery.SchemaField("run_id",              "STRING"),
+    bigquery.SchemaField("publisher_id",        "STRING"),
     bigquery.SchemaField("run_type",            "STRING"),
     bigquery.SchemaField("start_date",          "DATE"),
     bigquery.SchemaField("end_date",            "DATE"),
@@ -158,6 +176,7 @@ def validate_config() -> bool:
     required = {
         "GCP_PROJECT_ID":       PROJECT_ID,
         "BQ_DATASET_ID":        DATASET_ID,
+        "ADMOB_PUBLISHER_ID":   ADMOB_PUBLISHER_ID,
         "OAUTH_CLIENT_ID":      CLIENT_ID,
         "OAUTH_CLIENT_SECRET":  CLIENT_SECRET,
         "OAUTH_REFRESH_TOKEN":  REFRESH_TOKEN,
@@ -165,7 +184,14 @@ def validate_config() -> bool:
     }
     missing = [k for k, v in required.items() if not v]
     if missing:
-        print(f"ERROR: Missing env vars: {', '.join(missing)}")
+        print(f"❌ ERROR: Missing env vars: {', '.join(missing)}")
+        return False
+
+    # Extra strictness — publisher_id must look like a real AdMob publisher
+    pid = normalize_publisher_id(ADMOB_PUBLISHER_ID)
+    if not pid.startswith("pub-") or len(pid) < 10:
+        print(f"❌ ERROR: ADMOB_PUBLISHER_ID looks invalid: '{pid}'")
+        print(f"   Expected format: pub-XXXXXXXXXXXXXXXX")
         return False
     return True
 
@@ -174,7 +200,6 @@ def validate_config() -> bool:
 # =============================================================================
 
 def get_fresh_credentials() -> Credentials:
-    """Always returns a fresh valid token."""
     creds = Credentials(
         token=None,
         refresh_token=REFRESH_TOKEN,
@@ -293,6 +318,11 @@ def paginate(callable_, items_key: str) -> List[Dict]:
 def make_batches(items: List, batch_size: int) -> List[List]:
     return [items[i:i+batch_size] for i in range(0, len(items), batch_size)]
 
+def normalize_publisher_id(raw_or_resource: str) -> str:
+    if not raw_or_resource:
+        return ""
+    return raw_or_resource.replace("accounts/", "").strip()
+
 # =============================================================================
 # BIGQUERY OPS
 # =============================================================================
@@ -302,18 +332,64 @@ def ensure_dataset(bq: bigquery.Client):
     try:
         bq.get_dataset(ds_id)
         print(f"  Dataset exists: {ds_id}")
-    except Exception:
+    except NotFound:
         ds = bigquery.Dataset(ds_id)
         ds.location = BQ_LOCATION
         bq.create_dataset(ds)
         print(f"  Created dataset: {ds_id}")
+
+def migrate_table_schema(bq: bigquery.Client, table_name: str, expected_schema):
+    """
+    Auto-add missing columns to existing table.
+    ALTER TABLE ADD COLUMN IF NOT EXISTS for any missing columns.
+    Fixes schema drift between accounts using shared tables.
+    """
+    tid = f"{PROJECT_ID}.{DATASET_ID}.{table_name}"
+    try:
+        table = bq.get_table(tid)
+    except NotFound:
+        return  # Table doesn't exist — will be created fresh
+
+    existing_columns = {f.name for f in table.schema}
+    migrations_run = 0
+
+    for field in expected_schema:
+        if field.name in existing_columns:
+            continue
+
+        # REPEATED and RECORD columns can't be added via simple ALTER
+        if field.mode == "REPEATED" or field.field_type == "RECORD":
+            print(
+                f"  ⚠️  Cannot auto-migrate {table_name}.{field.name} "
+                f"({field.field_type}/{field.mode}) — needs manual ALTER"
+            )
+            continue
+
+        alter_sql = (
+            f"ALTER TABLE `{tid}` "
+            f"ADD COLUMN IF NOT EXISTS {field.name} {field.field_type}"
+        )
+        try:
+            bq.query(alter_sql).result()
+            print(f"  Migrated {table_name}: added {field.name} ({field.field_type})")
+            migrations_run += 1
+        except Exception as e:
+            print(f"  ⚠️  Migration failed for {table_name}.{field.name}: {e}")
+
+    # Wait for BQ metadata cache to refresh after schema changes
+    if migrations_run > 0:
+        print(f"  ⏱️  Waiting {SCHEMA_CACHE_WAIT_SEC}s for {table_name} schema cache to refresh …")
+        time.sleep(SCHEMA_CACHE_WAIT_SEC)
+        # Force refresh by re-fetching
+        bq.get_table(tid)
 
 def ensure_table(bq: bigquery.Client, name: str, schema, is_fact=False):
     tid = f"{PROJECT_ID}.{DATASET_ID}.{name}"
     try:
         bq.get_table(tid)
         print(f"  Table exists: {name}")
-    except Exception:
+        migrate_table_schema(bq, name, schema)
+    except NotFound:
         t = bigquery.Table(tid, schema=schema)
         if is_fact:
             t.time_partitioning = bigquery.TimePartitioning(
@@ -341,27 +417,96 @@ def load_rows(bq: bigquery.Client, table: str, schema, rows: List[Dict],
     print(f"  Loaded {n:,} rows → {table}")
     return n
 
-def delete_range(bq: bigquery.Client, table: str, start: date, end: date):
+def _verify_publisher_id_column(bq: bigquery.Client, table: str) -> bool:
+    """
+    Defensive check: confirm publisher_id column exists in table.
+    Guards against BigQuery metadata cache staleness right after migrations.
+    Returns True if column exists, False otherwise.
+    """
     tid = f"{PROJECT_ID}.{DATASET_ID}.{table}"
-    bq.query(
-        f"DELETE FROM `{tid}` WHERE report_date BETWEEN '{start}' AND '{end}'"
-    ).result()
-    print(f"  Deleted {table}: {start} → {end}")
+    try:
+        table_ref = bq.get_table(tid)
+        column_names = {f.name for f in table_ref.schema}
+        if 'publisher_id' not in column_names:
+            print(f"  ⚠️  {table} missing publisher_id column in cached schema")
+            return False
+        return True
+    except NotFound:
+        print(f"  ⚠️  {table} not found")
+        return False
+    except Exception as e:
+        print(f"  ⚠️  Could not verify {table} schema: {e}")
+        return True  # Proceed anyway — don't block on transient errors
 
-def write_log(bq, run_id, run_type, start, end, status, totals, error, duration):
+def delete_range_for_publisher(bq: bigquery.Client, table: str, publisher_id: str,
+                                start: date, end: date):
+    """
+    Delete ONLY this publisher's fact rows for the given date range.
+    Publisher-scoped — will NOT touch other accounts' data.
+    Retries on transient BQ errors.
+    Verifies publisher_id column exists first.
+    """
+    if not publisher_id:
+        raise ValueError("delete_range_for_publisher: publisher_id is required (empty)")
+
+    if not _verify_publisher_id_column(bq, table):
+        print(f"  ⚠️  Skipping DELETE for {table} — publisher_id column missing")
+        return
+
+    tid = f"{PROJECT_ID}.{DATASET_ID}.{table}"
+
+    def _do_delete():
+        return bq.query(
+            f"""
+            DELETE FROM `{tid}`
+            WHERE report_date BETWEEN '{start}' AND '{end}'
+              AND publisher_id = '{publisher_id}'
+            """
+        ).result()
+
+    with_retry(_do_delete, label=f"delete_range_{table}")
+    print(f"  Deleted {table} for {publisher_id}: {start} → {end}")
+
+def delete_dim_for_publisher(bq: bigquery.Client, table: str, publisher_id: str):
+    """
+    Delete ONLY this publisher's dim rows.
+    Publisher-scoped, retry-wrapped, schema-verified.
+    """
+    if not publisher_id:
+        raise ValueError("delete_dim_for_publisher: publisher_id is required (empty)")
+
+    if not _verify_publisher_id_column(bq, table):
+        print(f"  ⚠️  Skipping dim DELETE for {table} — publisher_id column missing")
+        return
+
+    tid = f"{PROJECT_ID}.{DATASET_ID}.{table}"
+
+    def _do_delete():
+        return bq.query(
+            f"""
+            DELETE FROM `{tid}`
+            WHERE publisher_id = '{publisher_id}'
+            """
+        ).result()
+
+    with_retry(_do_delete, label=f"delete_dim_{table}")
+    print(f"  Deleted dim {table} for {publisher_id}")
+
+def write_log(bq, run_id, publisher_id, run_type, start, end, status, totals, error, duration):
     row = [{
-        "run_id":           run_id,
-        "run_type":         run_type,
-        "start_date":       str(start),
-        "end_date":         str(end),
-        "status":           status,
-        "network_rows":     totals.get("network", 0),
+        "run_id":              run_id,
+        "publisher_id":        publisher_id,
+        "run_type":            run_type,
+        "start_date":          str(start),
+        "end_date":            str(end),
+        "status":              status,
+        "network_rows":        totals.get("network", 0),
         "network_adtype_rows": totals.get("network_adtype", 0),
-        "mediation_rows":   totals.get("mediation", 0),
-        "total_rows":       sum(totals.values()),
-        "error_message":    error,
-        "duration_seconds": round(duration, 2),
-        "sync_timestamp":   utc_now(),
+        "mediation_rows":      totals.get("mediation", 0),
+        "total_rows":          sum(totals.values()),
+        "error_message":       error,
+        "duration_seconds":    round(duration, 2),
+        "sync_timestamp":      utc_now(),
     }]
     try:
         load_rows(bq, LOG_TABLE, SYNC_LOG_SCHEMA, row)
@@ -369,22 +514,33 @@ def write_log(bq, run_id, run_type, start, end, status, totals, error, duration)
         print(f"  WARNING: sync_log write failed: {e}")
 
 # =============================================================================
-# DIMENSION SYNC
+# DIMENSION SYNC (publisher-scoped)
 # =============================================================================
 
-def sync_dims(v1, bq: bigquery.Client, account: str) -> List[str]:
-    """Sync dimension tables and return list of app_ids."""
+def sync_dims(v1, bq: bigquery.Client, account: str, publisher_id: str) -> List[str]:
     ts = utc_now()
 
     acc = with_retry(lambda: v1.accounts().get(name=account).execute())
+
+    # Account dim — publisher-scoped delete then append
+    if _verify_publisher_id_column(bq, DIM_ACCOUNT):
+        with_retry(lambda: bq.query(
+            f"""
+            DELETE FROM `{PROJECT_ID}.{DATASET_ID}.{DIM_ACCOUNT}`
+            WHERE publisher_id = '{publisher_id}'
+            """
+        ).result(), label="delete_account_dim")
+
     load_rows(bq, DIM_ACCOUNT, ACCOUNT_SCHEMA, [{
         "account_resource_name": acc.get("name"),
-        "publisher_id":          acc.get("publisherId"),
+        "publisher_id":          publisher_id,
         "reporting_time_zone":   acc.get("reportingTimeZone"),
         "currency_code":         acc.get("currencyCode"),
         "sync_timestamp":        ts,
-    }], disposition=bigquery.WriteDisposition.WRITE_TRUNCATE)
+    }])
 
+    # Apps dim
+    delete_dim_for_publisher(bq, DIM_APPS, publisher_id)
     apps = paginate(
         lambda pageToken=None: v1.accounts().apps().list(parent=account, pageToken=pageToken),
         "apps"
@@ -400,6 +556,7 @@ def sync_dims(v1, bq: bigquery.Client, account: str) -> List[str]:
         app_rows.append({
             "app_resource_name":   a.get("name"),
             "app_id":              app_id,
+            "publisher_id":        publisher_id,
             "platform":            a.get("platform"),
             "manual_display_name": mi.get("displayName"),
             "store_app_id":        li.get("appStoreId"),
@@ -407,9 +564,10 @@ def sync_dims(v1, bq: bigquery.Client, account: str) -> List[str]:
             "app_approval_state":  a.get("appApprovalState"),
             "sync_timestamp":      ts,
         })
-    load_rows(bq, DIM_APPS, APPS_SCHEMA, app_rows,
-              disposition=bigquery.WriteDisposition.WRITE_TRUNCATE)
+    load_rows(bq, DIM_APPS, APPS_SCHEMA, app_rows)
 
+    # Ad units dim
+    delete_dim_for_publisher(bq, DIM_AD_UNITS, publisher_id)
     units = paginate(
         lambda pageToken=None: v1.accounts().adUnits().list(parent=account, pageToken=pageToken),
         "adUnits"
@@ -417,24 +575,20 @@ def sync_dims(v1, bq: bigquery.Client, account: str) -> List[str]:
     unit_rows = [{
         "ad_unit_resource_name": u.get("name"),
         "ad_unit_id":            u.get("adUnitId"),
+        "publisher_id":          publisher_id,
         "app_id":                u.get("appId"),
         "ad_unit_display_name":  u.get("displayName"),
         "ad_format":             u.get("adFormat"),
         "ad_types":              u.get("adTypes", []),
         "sync_timestamp":        ts,
     } for u in units]
-    load_rows(bq, DIM_AD_UNITS, AD_UNITS_SCHEMA, unit_rows,
-              disposition=bigquery.WriteDisposition.WRITE_TRUNCATE)
+    load_rows(bq, DIM_AD_UNITS, AD_UNITS_SCHEMA, unit_rows)
 
-    print(f"  Found {len(app_ids)} apps, {len(unit_rows)} ad units")
+    print(f"  Publisher {publisher_id}: {len(app_ids)} apps, {len(unit_rows)} ad units")
     return app_ids
 
 # =============================================================================
 # REPORT SPECS
-# Removed high-cardinality dimensions:
-#   - SERVING_RESTRICTION (removed from all — was causing huge row counts)
-#   - AD_SOURCE_INSTANCE  (removed from mediation — too many combinations)
-#   - MOBILE_OS_VERSION, GMA_SDK_VERSION, APP_VERSION_NAME (already removed)
 # =============================================================================
 
 def _base_spec(start: date, end: date) -> Dict:
@@ -444,7 +598,6 @@ def _base_spec(start: date, end: date) -> Dict:
     }
 
 def _app_filter(app_ids: List[str]) -> Dict:
-    """Build a dimensionFilter to restrict report to specific apps."""
     return {
         "dimension": "APP",
         "matchesAny": {"values": app_ids}
@@ -452,35 +605,34 @@ def _app_filter(app_ids: List[str]) -> Dict:
 
 def network_spec(start, end, app_ids):
     spec = _base_spec(start, end)
-    spec["dimensions"]        = ["DATE", "APP", "AD_UNIT", "COUNTRY", "FORMAT", "PLATFORM"]
-    spec["metrics"]           = ["AD_REQUESTS", "MATCHED_REQUESTS", "MATCH_RATE",
-                                 "IMPRESSIONS", "CLICKS", "IMPRESSION_CTR",
-                                 "IMPRESSION_RPM", "ESTIMATED_EARNINGS", "SHOW_RATE"]
-    spec["dimensionFilters"]  = [_app_filter(app_ids)]
+    spec["dimensions"]       = ["DATE", "APP", "AD_UNIT", "COUNTRY", "FORMAT", "PLATFORM"]
+    spec["metrics"]          = ["AD_REQUESTS", "MATCHED_REQUESTS", "MATCH_RATE",
+                                "IMPRESSIONS", "CLICKS", "IMPRESSION_CTR",
+                                "IMPRESSION_RPM", "ESTIMATED_EARNINGS", "SHOW_RATE"]
+    spec["dimensionFilters"] = [_app_filter(app_ids)]
     return {"reportSpec": spec}
 
 def network_adtype_spec(start, end, app_ids):
     spec = _base_spec(start, end)
-    spec["dimensions"]        = ["DATE", "APP", "AD_UNIT", "AD_TYPE",
-                                 "COUNTRY", "FORMAT", "PLATFORM"]
-    spec["metrics"]           = ["MATCHED_REQUESTS", "IMPRESSIONS", "CLICKS",
-                                 "IMPRESSION_CTR", "ESTIMATED_EARNINGS", "SHOW_RATE"]
-    spec["dimensionFilters"]  = [_app_filter(app_ids)]
+    spec["dimensions"]       = ["DATE", "APP", "AD_UNIT", "AD_TYPE",
+                                "COUNTRY", "FORMAT", "PLATFORM"]
+    spec["metrics"]          = ["MATCHED_REQUESTS", "IMPRESSIONS", "CLICKS",
+                                "IMPRESSION_CTR", "ESTIMATED_EARNINGS", "SHOW_RATE"]
+    spec["dimensionFilters"] = [_app_filter(app_ids)]
     return {"reportSpec": spec}
 
 def mediation_spec(start, end, app_ids):
     spec = _base_spec(start, end)
-    # Removed AD_SOURCE_INSTANCE — too many combinations with 219 apps
-    spec["dimensions"]        = ["DATE", "APP", "AD_UNIT", "AD_SOURCE",
-                                 "MEDIATION_GROUP", "COUNTRY", "FORMAT", "PLATFORM"]
-    spec["metrics"]           = ["AD_REQUESTS", "MATCHED_REQUESTS", "MATCH_RATE",
-                                 "IMPRESSIONS", "CLICKS", "IMPRESSION_CTR",
-                                 "ESTIMATED_EARNINGS", "OBSERVED_ECPM"]
-    spec["dimensionFilters"]  = [_app_filter(app_ids)]
+    spec["dimensions"]       = ["DATE", "APP", "AD_UNIT", "AD_SOURCE",
+                                "MEDIATION_GROUP", "COUNTRY", "FORMAT", "PLATFORM"]
+    spec["metrics"]          = ["AD_REQUESTS", "MATCHED_REQUESTS", "MATCH_RATE",
+                                "IMPRESSIONS", "CLICKS", "IMPRESSION_CTR",
+                                "ESTIMATED_EARNINGS", "OBSERVED_ECPM"]
+    spec["dimensionFilters"] = [_app_filter(app_ids)]
     return {"reportSpec": spec}
 
 # =============================================================================
-# REPORT FETCHERS
+# FETCHERS
 # =============================================================================
 
 def fetch_network(v1, account, body):
@@ -494,12 +646,13 @@ def fetch_mediation_report(v1, account, body):
     )
 
 # =============================================================================
-# ROW PARSERS
+# PARSERS
 # =============================================================================
 
-def _empty_row(source: str, ts: str, run_id: str) -> Dict:
+def _empty_row(source: str, ts: str, run_id: str, publisher_id: str) -> Dict:
     return {
         "data_source": source, "run_id": run_id, "sync_timestamp": ts,
+        "publisher_id": publisher_id,
         "app_id": None, "app_name": None, "platform": None,
         "ad_unit_id": None, "ad_unit_name": None,
         "ad_format": None, "ad_type": None,
@@ -525,7 +678,7 @@ def _set_base_dims(row, dims):
         "country_name": dim_lbl(dims, "COUNTRY"),
     })
 
-def parse_network_rows(report, run_id):
+def parse_network_rows(report, run_id, publisher_id):
     ts, rows = utc_now(), []
     for item in report:
         rd = item.get("row")
@@ -533,7 +686,7 @@ def parse_network_rows(report, run_id):
         dims, mets = rd.get("dimensionValues", {}), rd.get("metricValues", {})
         dt = parse_date_from_dims(dims)
         if not dt: continue
-        row = _empty_row("admob_network", ts, run_id)
+        row = _empty_row("admob_network", ts, run_id, publisher_id)
         row["report_date"] = dt
         _set_base_dims(row, dims)
         imp  = metric_val(mets.get("IMPRESSIONS"))
@@ -555,7 +708,7 @@ def parse_network_rows(report, run_id):
         rows.append(row)
     return rows
 
-def parse_network_adtype_rows(report, run_id):
+def parse_network_adtype_rows(report, run_id, publisher_id):
     ts, rows = utc_now(), []
     for item in report:
         rd = item.get("row")
@@ -563,7 +716,7 @@ def parse_network_adtype_rows(report, run_id):
         dims, mets = rd.get("dimensionValues", {}), rd.get("metricValues", {})
         dt = parse_date_from_dims(dims)
         if not dt: continue
-        row = _empty_row("admob_network_adtype", ts, run_id)
+        row = _empty_row("admob_network_adtype", ts, run_id, publisher_id)
         row["report_date"] = dt
         _set_base_dims(row, dims)
         imp  = metric_val(mets.get("IMPRESSIONS"))
@@ -582,7 +735,7 @@ def parse_network_adtype_rows(report, run_id):
         rows.append(row)
     return rows
 
-def parse_mediation_rows(report, run_id):
+def parse_mediation_rows(report, run_id, publisher_id):
     ts, rows = utc_now(), []
     for item in report:
         rd = item.get("row")
@@ -590,7 +743,7 @@ def parse_mediation_rows(report, run_id):
         dims, mets = rd.get("dimensionValues", {}), rd.get("metricValues", {})
         dt = parse_date_from_dims(dims)
         if not dt: continue
-        row = _empty_row("admob_mediation", ts, run_id)
+        row = _empty_row("admob_mediation", ts, run_id, publisher_id)
         row["report_date"] = dt
         _set_base_dims(row, dims)
         imp  = metric_val(mets.get("IMPRESSIONS"))
@@ -617,28 +770,22 @@ def parse_mediation_rows(report, run_id):
     return rows
 
 # =============================================================================
-# BATCHED FETCH — Core fix for 100K row limit
+# BATCHED FETCH
 # =============================================================================
 
-def fetch_batched(v1, account, app_ids, start, end, run_id,
+def fetch_batched(v1, account, app_ids, start, end, run_id, publisher_id,
                   spec_fn, parse_fn, fetch_fn, batch_size, label):
-    """
-    Fetch a report in app-batched chunks.
-    Each request is limited to batch_size apps via dimensionFilters.
-    This guarantees we never approach the 100K row limit.
-    """
-    all_rows  = []
-    batches   = make_batches(app_ids, batch_size)
-    total_b   = len(batches)
+    all_rows = []
+    batches  = make_batches(app_ids, batch_size)
+    total_b  = len(batches)
 
     for i, batch in enumerate(batches, 1):
         body = spec_fn(start, end, batch)
         try:
             report = fetch_fn(v1, account, body)
-            rows   = parse_fn(report, run_id)
+            rows   = parse_fn(report, run_id, publisher_id)
             if len(rows) >= ROW_LIMIT_WARN:
-                print(f"  ⚠️  {label} batch {i}/{total_b}: {len(rows):,} rows — "
-                      f"near 100K limit! Reduce batch size if this hits 100K.")
+                print(f"  ⚠️  {label} batch {i}/{total_b}: {len(rows):,} rows — near 100K limit!")
             all_rows.extend(rows)
         except HttpError as e:
             if e.resp.status == 403:
@@ -649,21 +796,25 @@ def fetch_batched(v1, account, app_ids, start, end, run_id,
     return all_rows
 
 # =============================================================================
-# ACCOUNT
+# ACCOUNT RESOLUTION
 # =============================================================================
 
 def get_account_name(v1) -> str:
-    if ADMOB_PUBLISHER_ID:
-        raw = ADMOB_PUBLISHER_ID.strip()
-        return raw if raw.startswith("accounts/") else f"accounts/{raw}"
-    resp = with_retry(lambda: v1.accounts().list().execute())
-    accounts = resp.get("account", []) or resp.get("accounts", [])
-    if not accounts:
-        raise ValueError("No AdMob accounts found.")
-    return accounts[0]["name"]
+    """
+    Resolve AdMob account resource name.
+    HARD FAILS if ADMOB_PUBLISHER_ID env var is empty — won't fall back to
+    accounts[0] like the old script (which could pick the wrong account).
+    """
+    if not ADMOB_PUBLISHER_ID:
+        raise ValueError(
+            "ADMOB_PUBLISHER_ID env var is required. "
+            "Refusing to auto-pick from accounts.list() to prevent wrong account."
+        )
+    raw = ADMOB_PUBLISHER_ID.strip()
+    return raw if raw.startswith("accounts/") else f"accounts/{raw}"
 
 # =============================================================================
-# ENSURE TABLES
+# TABLES
 # =============================================================================
 
 def ensure_all_tables(bq: bigquery.Client):
@@ -677,44 +828,37 @@ def ensure_all_tables(bq: bigquery.Client):
 
 # =============================================================================
 # SYNC ONE DAY
-# Always 1-day chunks — multi-day chunks multiply rows and risk hitting 100K
 # =============================================================================
 
-def sync_one_day(v1, bq, account, app_ids, day, run_id) -> Dict[str, int]:
+def sync_one_day(v1, bq, account, app_ids, publisher_id, day, run_id) -> Dict[str, int]:
     totals = {"network": 0, "network_adtype": 0, "mediation": 0}
 
-    delete_range(bq, FACT_TABLE, day, day)
+    delete_range_for_publisher(bq, FACT_TABLE, publisher_id, day, day)
 
-    # 1. Network (batch_size=5)
-    print(f"  [{day}] Fetching network …")
+    print(f"  [{day}] Fetching network for {publisher_id} …")
     net_rows = fetch_batched(
-        v1, account, app_ids, day, day, run_id,
+        v1, account, app_ids, day, day, run_id, publisher_id,
         network_spec, parse_network_rows, fetch_network,
         BATCH_NETWORK, "network"
     )
     totals["network"] = load_rows(bq, FACT_TABLE, UNIFIED_FACT_SCHEMA, net_rows)
-    print(f"  [{day}] network total: {totals['network']:,} rows")
 
-    # 2. Network adtype (batch_size=3)
-    print(f"  [{day}] Fetching network_adtype …")
+    print(f"  [{day}] Fetching network_adtype for {publisher_id} …")
     nat_rows = fetch_batched(
-        v1, account, app_ids, day, day, run_id,
+        v1, account, app_ids, day, day, run_id, publisher_id,
         network_adtype_spec, parse_network_adtype_rows, fetch_network,
         BATCH_NETWORK_ADTYPE, "network_adtype"
     )
     totals["network_adtype"] = load_rows(bq, FACT_TABLE, UNIFIED_FACT_SCHEMA, nat_rows)
-    print(f"  [{day}] network_adtype total: {totals['network_adtype']:,} rows")
 
-    # 3. Mediation (batch_size=2)
-    print(f"  [{day}] Fetching mediation …")
+    print(f"  [{day}] Fetching mediation for {publisher_id} …")
     try:
         med_rows = fetch_batched(
-            v1, account, app_ids, day, day, run_id,
+            v1, account, app_ids, day, day, run_id, publisher_id,
             mediation_spec, parse_mediation_rows, fetch_mediation_report,
             BATCH_MEDIATION, "mediation"
         )
         totals["mediation"] = load_rows(bq, FACT_TABLE, UNIFIED_FACT_SCHEMA, med_rows)
-        print(f"  [{day}] mediation total: {totals['mediation']:,} rows")
     except HttpError as e:
         if e.resp.status == 403:
             print(f"  [{day}] WARNING: Mediation skipped — 403 (no access)")
@@ -724,16 +868,17 @@ def sync_one_day(v1, bq, account, app_ids, day, run_id) -> Dict[str, int]:
     return totals
 
 # =============================================================================
-# MAIN SYNC
+# SYNC + BACKFILL
 # =============================================================================
 
 def sync(days_back: int = 3):
-    rid      = run_id_now()
-    t0       = time.time()
-    end_date = datetime.utcnow().date() - timedelta(days=1)
-    start_date = end_date - timedelta(days=days_back - 1)
+    publisher_id = normalize_publisher_id(ADMOB_PUBLISHER_ID)
+    rid          = run_id_now()
+    t0           = time.time()
+    end_date     = datetime.utcnow().date() - timedelta(days=1)
+    start_date   = end_date - timedelta(days=days_back - 1)
 
-    print(f"\n=== AdMob Unified Sync v3 | run_id={rid} ===")
+    print(f"\n=== AdMob Sync v4 | publisher={publisher_id} | run_id={rid} ===")
     print(f"  Date range : {start_date} → {end_date}")
 
     creds   = get_fresh_credentials()
@@ -745,18 +890,17 @@ def sync(days_back: int = 3):
     ensure_all_tables(bq)
 
     print("\nSyncing dimensions …")
-    app_ids = sync_dims(v1, bq, account)
+    app_ids = sync_dims(v1, bq, account, publisher_id)
 
-    grand  = {"network": 0, "network_adtype": 0, "mediation": 0}
+    grand = {"network": 0, "network_adtype": 0, "mediation": 0}
     error, status = None, "SUCCESS"
 
     try:
         cur = start_date
         while cur <= end_date:
-            # Refresh token for every day
             creds = get_fresh_credentials()
             v1    = get_v1(creds)
-            t = sync_one_day(v1, bq, account, app_ids, cur, rid)
+            t = sync_one_day(v1, bq, account, app_ids, publisher_id, cur, rid)
             for k in grand:
                 grand[k] += t.get(k, 0)
             cur += timedelta(days=1)
@@ -765,24 +909,21 @@ def sync(days_back: int = 3):
         status, error = "FAILED", str(e)
         raise
     finally:
-        write_log(bq, rid, "sync", start_date, end_date, status, grand, error, time.time()-t0)
+        write_log(bq, rid, publisher_id, "sync", start_date, end_date,
+                  status, grand, error, time.time()-t0)
 
-    print(f"\n=== Sync complete ===")
+    print(f"\n=== Sync complete for {publisher_id} ===")
     print(json.dumps(grand, indent=2))
 
-# =============================================================================
-# BACKFILL
-# =============================================================================
-
 def backfill(start_str: str, end_str: str):
-    rid        = run_id_now()
-    t0         = time.time()
-    start_date = datetime.strptime(start_str, "%Y-%m-%d").date()
-    end_date   = datetime.strptime(end_str,   "%Y-%m-%d").date()
+    publisher_id = normalize_publisher_id(ADMOB_PUBLISHER_ID)
+    rid          = run_id_now()
+    t0           = time.time()
+    start_date   = datetime.strptime(start_str, "%Y-%m-%d").date()
+    end_date     = datetime.strptime(end_str,   "%Y-%m-%d").date()
 
-    print(f"\n=== AdMob Backfill v3 | run_id={rid} ===")
+    print(f"\n=== AdMob Backfill v4 | publisher={publisher_id} | run_id={rid} ===")
     print(f"  Date range : {start_date} → {end_date}")
-    print(f"  Always 1-day chunks — guaranteed no 100K truncation")
 
     creds   = get_fresh_credentials()
     v1      = get_v1(creds)
@@ -793,24 +934,23 @@ def backfill(start_str: str, end_str: str):
     ensure_all_tables(bq)
 
     print("\nSyncing dimensions …")
-    app_ids = sync_dims(v1, bq, account)
+    app_ids = sync_dims(v1, bq, account, publisher_id)
 
-    grand  = {"network": 0, "network_adtype": 0, "mediation": 0}
+    grand = {"network": 0, "network_adtype": 0, "mediation": 0}
     error, status = None, "SUCCESS"
-    cur    = start_date
+    cur   = start_date
     total_days = (end_date - start_date).days + 1
-    done   = 0
+    done  = 0
 
     try:
         while cur <= end_date:
             done += 1
             print(f"\n--- Day {done}/{total_days}: {cur} ---")
 
-            # Refresh token every day
             creds = get_fresh_credentials()
             v1    = get_v1(creds)
 
-            t = sync_one_day(v1, bq, account, app_ids, cur, rid)
+            t = sync_one_day(v1, bq, account, app_ids, publisher_id, cur, rid)
             for k in grand:
                 grand[k] += t.get(k, 0)
 
@@ -821,9 +961,10 @@ def backfill(start_str: str, end_str: str):
         status, error = "FAILED", str(e)
         raise
     finally:
-        write_log(bq, rid, "backfill", start_date, end_date, status, grand, error, time.time()-t0)
+        write_log(bq, rid, publisher_id, "backfill", start_date, end_date,
+                  status, grand, error, time.time()-t0)
 
-    print(f"\n=== Backfill complete ===")
+    print(f"\n=== Backfill complete for {publisher_id} ===")
     print(json.dumps(grand, indent=2))
 
 # =============================================================================
@@ -831,17 +972,14 @@ def backfill(start_str: str, end_str: str):
 # =============================================================================
 
 def main():
-    p = argparse.ArgumentParser(description="AdMob → BigQuery unified sync v3")
-    p.add_argument("--days",           type=int, default=3,
-                   help="Days to sync from yesterday (default: 3)")
-    p.add_argument("--backfill-start", type=str,
-                   help="Backfill start date YYYY-MM-DD")
-    p.add_argument("--backfill-end",   type=str,
-                   help="Backfill end date YYYY-MM-DD")
-    # Keep these for backwards compatibility with existing YML
-    p.add_argument("--chunk",            type=int, default=1)
-    p.add_argument("--chunk-days",       type=int, default=1)
-    p.add_argument("--enable-campaign",  action="store_true")
+    p = argparse.ArgumentParser(description="AdMob → BigQuery sync v4")
+    p.add_argument("--days",           type=int, default=3)
+    p.add_argument("--backfill-start", type=str)
+    p.add_argument("--backfill-end",   type=str)
+    # Kept for backwards compatibility with existing GitHub Actions YAML
+    p.add_argument("--chunk",          type=int, default=1)
+    p.add_argument("--chunk-days",     type=int, default=1)
+    p.add_argument("--enable-campaign", action="store_true")
     p.add_argument("--enable-campaign-beta", action="store_true")
     args = p.parse_args()
 
