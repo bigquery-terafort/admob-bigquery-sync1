@@ -74,10 +74,16 @@ jobs:
       - name: "🩺 Pehle ki haalat — rows aur aakhri din"
         id: before
         continue-on-error: true
+        # 🔑 SHARED TABLE: chaaron AdMob loaders ek hi table mein likhte hain.
+        #    Is liye sirf APNE publisher ka aakhri din dekho — warna doosre
+        #    account ka Sep 18 dekh kar "skip" ho jayega jabke apna nahi aaya.
+        #    (Live 2026-09-19: AdMob-1/3 Sep 17 par atke, AdMob-2/4 Sep 18 par.)
+        env:
+          ADMOB_PUBLISHER_ID: ${{ secrets.ADMOB_PUBLISHER_ID }}
         run: |
           set +e
           R=$(bq query --nouse_legacy_sql --format=csv --quiet \
-            "SELECT COUNT(*), CAST(MAX(report_date) AS STRING) FROM \`terafort.Admob.admob_unified_fact\`" 2>/dev/null | tail -1)
+            "SELECT COUNT(*), CAST(MAX(report_date) AS STRING) FROM \`terafort.Admob.admob_unified_fact\` WHERE publisher_id = '${ADMOB_PUBLISHER_ID}' AND data_source = 'admob_mediation'" 2>/dev/null | tail -1)
           ROWS=$(echo "$R" | cut -d, -f1); LAST=$(echo "$R" | cut -d, -f2)
           echo "📊 pehle: ${ROWS:-?} rows · aakhri din ${LAST:-?}"
           echo "rows=${ROWS:-0}" >> "$GITHUB_OUTPUT"
@@ -213,12 +219,14 @@ jobs:
       #     purana data waise hi mehfooz rehta hai.
       - name: "🛡️ Baad mein verify — bad data nahi jaana chahiye"
         if: always() && steps.before.outputs.skip != 'true'
+        env:
+          ADMOB_PUBLISHER_ID: ${{ secrets.ADMOB_PUBLISHER_ID }}
         run: |
           set +e
           BEFORE_ROWS="${{ steps.before.outputs.rows || '0' }}"
           BEFORE_LAST="${{ steps.before.outputs.last || '' }}"
           R=$(bq query --nouse_legacy_sql --format=csv --quiet \
-            "SELECT COUNT(*), CAST(MAX(report_date) AS STRING), COUNTIF(report_date IS NULL) FROM \`terafort.Admob.admob_unified_fact\`" 2>/dev/null | tail -1)
+            "SELECT COUNT(*), CAST(MAX(report_date) AS STRING), COUNTIF(report_date IS NULL) FROM \`terafort.Admob.admob_unified_fact\` WHERE publisher_id = '${ADMOB_PUBLISHER_ID}' AND data_source = 'admob_mediation'" 2>/dev/null | tail -1)
           if [ -z "$R" ]; then
             echo "::warning::verify skip — bq query nahi chali (setup-gcloud hai?)"
             exit 0
